@@ -11,6 +11,15 @@ import { z } from 'zod';
 
 type ApprovalMode = 'untrusted' | 'on-request' | 'never';
 type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+type OutputMode = 'clean' | 'raw';
+
+interface SessionOutputView {
+    output: string;
+    outputMode: OutputMode;
+    rawChars: number;
+    returnedChars: number;
+    truncated: boolean;
+}
 
 interface CodexSession {
     id: string;
@@ -28,6 +37,7 @@ interface CodexSession {
 
 const MAX_BUFFER_CHARS = 250_000;
 const DEFAULT_READ_CHARS = 12_000;
+const DEFAULT_READ_LINES = 160;
 const sessions = new Map<string, CodexSession>();
 const isWindows = platform() === 'win32';
 
@@ -77,10 +87,64 @@ function trimSessionBuffer(session: CodexSession): void {
     }
 }
 
-function lastOutput(session: CodexSession, maxChars = DEFAULT_READ_CHARS, clear = false): string {
-    const output = session.output.slice(-Math.max(1, maxChars));
-    if (clear) session.output = '';
-    return output;
+function stripAnsi(input: string): string {
+    return input
+        .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+        .replace(/\x1B[PX^_].*?\x1B\\/gs, '')
+        .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+        .replace(/\x1B[()][A-Za-z0-9]/g, '')
+        .replace(/\x1B[=>78]/g, '')
+        .replace(/\x1B[@-Z\\-_]/g, '');
+}
+
+function normalizeTerminalOutput(input: string): string {
+    const text = stripAnsi(input)
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+
+    const lines: string[] = [];
+    let previous = '';
+    for (const rawLine of text.split('\n')) {
+        const line = rawLine.replace(/[ \t]+$/g, '');
+        if (line === previous && line.trim() !== '') continue;
+        lines.push(line);
+        previous = line;
+    }
+
+    return lines.join('\n')
+        .replace(/\n{4,}/g, '\n\n\n')
+        .trim();
+}
+
+function tailLines(input: string, maxLines: number): string {
+    const lines = input.split('\n');
+    if (lines.length <= maxLines) return input;
+    return lines.slice(lines.length - maxLines).join('\n');
+}
+
+function lastOutput(session: CodexSession, opts: {
+    maxChars?: number;
+    clear?: boolean;
+    outputMode?: OutputMode;
+    maxLines?: number;
+} = {}): SessionOutputView {
+    const maxChars = Math.max(1, opts.maxChars ?? DEFAULT_READ_CHARS);
+    const outputMode = opts.outputMode ?? 'clean';
+    const maxLines = Math.max(1, opts.maxLines ?? DEFAULT_READ_LINES);
+    const rawChars = session.output.length;
+    const source = outputMode === 'raw' ? session.output : normalizeTerminalOutput(session.output);
+    const lineLimited = outputMode === 'raw' ? source : tailLines(source, maxLines);
+    const output = lineLimited.slice(-maxChars);
+    const truncated = output.length < source.length;
+    if (opts.clear) session.output = '';
+    return {
+        output,
+        outputMode,
+        rawChars,
+        returnedChars: output.length,
+        truncated,
+    };
 }
 
 function controlSequence(name: string): string {
@@ -155,6 +219,7 @@ const server = new McpServer({
 
 const approvalSchema = z.enum(['untrusted', 'on-request', 'never']);
 const sandboxSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access']);
+const outputModeSchema = z.enum(['clean', 'raw']);
 
 server.registerTool(
     'check_codex_cli',
@@ -270,9 +335,12 @@ server.registerTool(
             cols: z.number().int().min(40).max(240).optional().default(120).describe('PTY columns.'),
             rows: z.number().int().min(10).max(80).optional().default(32).describe('PTY rows.'),
             initial_read_ms: z.number().int().min(0).max(10_000).optional().default(1000).describe('Milliseconds to wait before returning initial output.'),
+            output_mode: outputModeSchema.optional().default('clean').describe('Return clean readable terminal text by default, or raw PTY bytes for debugging.'),
+            max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS).describe('Maximum characters to return from the initial output.'),
+            max_lines: z.number().int().min(1).max(2_000).optional().default(DEFAULT_READ_LINES).describe('Maximum cleaned terminal lines to return before applying max_chars. Ignored for raw output.'),
         },
     },
-    async ({ prompt, cwd, codex_command, model, profile, approval, sandbox, search, yolo, add_dirs, config, no_alt_screen, cols, rows, initial_read_ms }) => {
+    async ({ prompt, cwd, codex_command, model, profile, approval, sandbox, search, yolo, add_dirs, config, no_alt_screen, cols, rows, initial_read_ms, output_mode, max_chars, max_lines }) => {
         try {
             const resolvedCwd = resolveCwd(cwd);
             const command = codexCommand(codex_command);
@@ -336,7 +404,7 @@ server.registerTool(
                         args,
                         cwd: resolvedCwd,
                         running: session.exitCode === undefined,
-                        output: lastOutput(session),
+                        ...lastOutput(session, { maxChars: max_chars, outputMode: output_mode, maxLines: max_lines }),
                     }),
                 }],
             };
@@ -356,10 +424,12 @@ server.registerTool(
         inputSchema: {
             session_id: z.string().describe('Session ID returned by start_codex_session.'),
             max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS).describe('Maximum characters to return from the end of the buffer.'),
+            max_lines: z.number().int().min(1).max(2_000).optional().default(DEFAULT_READ_LINES).describe('Maximum cleaned terminal lines to return before applying max_chars. Ignored for raw output.'),
+            output_mode: outputModeSchema.optional().default('clean').describe('Return clean readable terminal text by default, or raw PTY bytes for debugging.'),
             clear: z.boolean().optional().default(false).describe('Clear the session buffer after reading.'),
         },
     },
-    async ({ session_id, max_chars, clear }) => {
+    async ({ session_id, max_chars, max_lines, output_mode, clear }) => {
         const session = sessions.get(session_id);
         if (!session) {
             return { content: [{ type: 'text', text: `Unknown Codex session: ${session_id}` }], isError: true };
@@ -372,7 +442,7 @@ server.registerTool(
                     running: session.exitCode === undefined,
                     exitCode: session.exitCode,
                     exitSignal: session.exitSignal,
-                    output: lastOutput(session, max_chars, clear),
+                    ...lastOutput(session, { maxChars: max_chars, maxLines: max_lines, outputMode: output_mode, clear }),
                 }),
             }],
         };
@@ -390,9 +460,11 @@ server.registerTool(
             control: z.enum(['enter', 'escape', 'tab', 'ctrl-c', 'ctrl-d', 'ctrl-l', 'ctrl-o', 'up', 'down', 'left', 'right']).optional().describe('Optional control key to send after text.'),
             read_after_ms: z.number().int().min(0).max(10_000).optional().default(1000).describe('Milliseconds to wait before returning new output.'),
             max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS).describe('Maximum characters of output to return.'),
+            max_lines: z.number().int().min(1).max(2_000).optional().default(DEFAULT_READ_LINES).describe('Maximum cleaned terminal lines to return before applying max_chars. Ignored for raw output.'),
+            output_mode: outputModeSchema.optional().default('clean').describe('Return clean readable terminal text by default, or raw PTY bytes for debugging.'),
         },
     },
-    async ({ session_id, text, submit, control, read_after_ms, max_chars }) => {
+    async ({ session_id, text, submit, control, read_after_ms, max_chars, max_lines, output_mode }) => {
         const session = sessions.get(session_id);
         if (!session) {
             return { content: [{ type: 'text', text: `Unknown Codex session: ${session_id}` }], isError: true };
@@ -414,7 +486,7 @@ server.registerTool(
                     text: jsonText({
                         sessionId: session.id,
                         running: session.exitCode === undefined,
-                        output: lastOutput(session, max_chars),
+                        ...lastOutput(session, { maxChars: max_chars, maxLines: max_lines, outputMode: output_mode }),
                     }),
                 }],
             };

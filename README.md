@@ -36,6 +36,8 @@ codex-terminal
 
 The interactive session uses `--no-alt-screen` by default so terminal output is easier for MCP clients to capture. Use `send_codex_input` with `submit=true` to send a prompt to the Codex composer, or send raw control characters for keys such as Ctrl+C.
 
+Interactive reads return `output_mode: "clean"` by default. This strips ANSI/control sequences, collapses adjacent duplicate lines, and limits cleaned output by both `max_lines` and `max_chars` so calling LLMs get the readable tail of the session instead of raw terminal redraw noise. Pass `output_mode: "raw"` to `start_codex_session`, `read_codex_session`, or `send_codex_input` when you need exact PTY bytes for debugging.
+
 Codex authentication is handled by your existing Codex CLI install. Run `codex login` outside this MCP if the CLI is not authenticated.
 
 ## MCP Config
