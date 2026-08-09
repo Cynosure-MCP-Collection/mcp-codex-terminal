@@ -224,6 +224,7 @@ const outputModeSchema = z.enum(['clean', 'raw']);
 server.registerTool(
     'check_codex_cli',
     {
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         description: 'Check whether the Codex CLI is available and report its version.',
         inputSchema: {
             codex_command: z.string().optional().describe('Codex executable path or command name. Defaults to CODEX_CLI_PATH or codex.'),
@@ -252,6 +253,7 @@ server.registerTool(
 server.registerTool(
     'codex_exec',
     {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Run Codex non-interactively with codex exec and return stdout/stderr. This is best for one-shot coding tasks or scripted automation.',
         inputSchema: {
             prompt: z.string().min(1).describe('Task prompt to pass to codex exec.'),
@@ -318,6 +320,7 @@ server.registerTool(
 server.registerTool(
     'start_codex_session',
     {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Start an interactive Codex CLI terminal session in a PTY. Use read_codex_session and send_codex_input to interact with it.',
         inputSchema: {
             prompt: z.string().optional().describe('Optional initial prompt to pass to codex.'),
@@ -420,6 +423,7 @@ server.registerTool(
 server.registerTool(
     'read_codex_session',
     {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Read buffered terminal output from a running or recently exited interactive Codex session.',
         inputSchema: {
             session_id: z.string().describe('Session ID returned by start_codex_session.'),
@@ -452,6 +456,7 @@ server.registerTool(
 server.registerTool(
     'send_codex_input',
     {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Send text or a control key to an interactive Codex session.',
         inputSchema: {
             session_id: z.string().describe('Session ID returned by start_codex_session.'),
@@ -502,6 +507,7 @@ server.registerTool(
 server.registerTool(
     'stop_codex_session',
     {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Stop an interactive Codex session.',
         inputSchema: {
             session_id: z.string().describe('Session ID returned by start_codex_session.'),
@@ -532,6 +538,7 @@ server.registerTool(
 server.registerTool(
     'list_codex_sessions',
     {
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         description: 'List interactive Codex sessions currently tracked by this MCP process.',
         inputSchema: {},
     },
