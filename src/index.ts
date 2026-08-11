@@ -214,7 +214,7 @@ const server = new McpServer({
     version: '1.0.0',
     title: 'Codex Terminal',
     description: 'Start and control OpenAI Codex CLI coding sessions.',
-    icons: [{ src: 'https://raw.githubusercontent.com/andreasjhagen/Cynosure-MCPs/main/mcp-codex-terminal/icon.png', mimeType: 'image/png' }],
+    icons: [{ src: 'https://unpkg.com/@cynosure-mcp/codex-terminal@1.0.1/icon.png', mimeType: 'image/png' }],
 });
 
 const approvalSchema = z.enum(['untrusted', 'on-request', 'never']);

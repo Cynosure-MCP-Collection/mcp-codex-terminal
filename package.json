@@ -1,7 +1,7 @@
 {
     "name": "@cynosure-mcp/codex-terminal",
     "mcpName": "io.github.andreasjhagen/codex-terminal",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "MCP server for starting and controlling Codex CLI coding sessions",
     "type": "module",
     "main": "dist/index.js",
