@@ -38,5 +38,13 @@
         "openai",
         "terminal",
         "coding-agent"
-    ]
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Cynosure-MCP-Collection/mcp-codex-terminal.git"
+    },
+    "homepage": "https://github.com/Cynosure-MCP-Collection/mcp-codex-terminal#readme",
+    "bugs": {
+        "url": "https://github.com/Cynosure-MCP-Collection/mcp-codex-terminal/issues"
+    }
 }
