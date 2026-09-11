@@ -9,7 +9,7 @@ import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { z } from 'zod';
 
-type ApprovalMode = 'untrusted' | 'on-request' | 'never';
+type ApprovalMode = 'on-request' | 'never';
 type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 type OutputMode = 'clean' | 'raw';
 
@@ -19,6 +19,8 @@ interface SessionOutputView {
     rawChars: number;
     returnedChars: number;
     truncated: boolean;
+    nextOffset: number;
+    droppedChars: number;
 }
 
 interface CodexSession {
@@ -31,14 +33,34 @@ interface CodexSession {
     rows: number;
     process: pty.IPty;
     output: string;
+    bufferStartOffset: number;
     exitCode?: number;
     exitSignal?: number;
+}
+
+interface CodexJob {
+    id: string;
+    command: string;
+    args: string[];
+    cwd: string;
+    createdAt: string;
+    process: ReturnType<typeof spawnChild>;
+    output: string;
+    bufferStartOffset: number;
+    exitCode?: number | null;
+    exitSignal?: NodeJS.Signals | null;
+    timedOut: boolean;
+    threadId?: string;
+    timeout?: NodeJS.Timeout;
+    killTimeout?: NodeJS.Timeout;
 }
 
 const MAX_BUFFER_CHARS = 250_000;
 const DEFAULT_READ_CHARS = 12_000;
 const DEFAULT_READ_LINES = 160;
+const FINISHED_RETENTION_MS = 24 * 60 * 60 * 1000;
 const sessions = new Map<string, CodexSession>();
+const jobs = new Map<string, CodexJob>();
 const isWindows = platform() === 'win32';
 
 function log(msg: string): void {
@@ -59,8 +81,20 @@ function codexCommand(command?: string): string {
     return configured;
 }
 
+function killChildTree(child: ReturnType<typeof spawnChild>, signal: NodeJS.Signals): void {
+    try {
+        if (!isWindows && child.pid) {
+            process.kill(-child.pid, signal);
+        } else {
+            child.kill(signal);
+        }
+    } catch {
+        try { child.kill(signal); } catch { /* process already exited */ }
+    }
+}
+
 function appendCommonCodexArgs(args: string[], opts: {
-    cwd?: string;
+    cwd: string;
     model?: string;
     profile?: string;
     approval?: ApprovalMode;
@@ -70,20 +104,32 @@ function appendCommonCodexArgs(args: string[], opts: {
     addDirs?: string[];
     config?: string[];
 }): void {
-    if (opts.cwd) args.push('--cd', opts.cwd);
     if (opts.model) args.push('--model', opts.model);
     if (opts.profile) args.push('--profile', opts.profile);
     if (opts.approval) args.push('--ask-for-approval', opts.approval);
     if (opts.sandbox) args.push('--sandbox', opts.sandbox);
     if (opts.search) args.push('--search');
     if (opts.yolo) args.push('--dangerously-bypass-approvals-and-sandbox');
-    for (const dir of opts.addDirs || []) args.push('--add-dir', path.resolve(dir));
+    for (const dir of opts.addDirs || []) args.push('--add-dir', path.resolve(opts.cwd, dir));
     for (const cfg of opts.config || []) args.push('--config', cfg);
 }
 
 function trimSessionBuffer(session: CodexSession): void {
     if (session.output.length > MAX_BUFFER_CHARS) {
-        session.output = session.output.slice(session.output.length - MAX_BUFFER_CHARS);
+        const removeCount = session.output.length - MAX_BUFFER_CHARS;
+        session.output = session.output.slice(removeCount);
+        session.bufferStartOffset += removeCount;
+    }
+}
+
+function appendJobOutput(job: CodexJob, data: string): void {
+    job.output += data;
+    const threadMatch = job.output.match(/"thread_id"\s*:\s*"([^"]+)"/);
+    if (threadMatch) job.threadId = threadMatch[1];
+    if (job.output.length > MAX_BUFFER_CHARS) {
+        const removeCount = job.output.length - MAX_BUFFER_CHARS;
+        job.output = job.output.slice(removeCount);
+        job.bufferStartOffset += removeCount;
     }
 }
 
@@ -128,22 +174,51 @@ function lastOutput(session: CodexSession, opts: {
     clear?: boolean;
     outputMode?: OutputMode;
     maxLines?: number;
+    sinceOffset?: number;
 } = {}): SessionOutputView {
     const maxChars = Math.max(1, opts.maxChars ?? DEFAULT_READ_CHARS);
     const outputMode = opts.outputMode ?? 'clean';
     const maxLines = Math.max(1, opts.maxLines ?? DEFAULT_READ_LINES);
-    const rawChars = session.output.length;
-    const source = outputMode === 'raw' ? session.output : normalizeTerminalOutput(session.output);
+    const requestedOffset = opts.sinceOffset ?? session.bufferStartOffset;
+    const droppedChars = Math.max(0, session.bufferStartOffset - requestedOffset);
+    const startIndex = Math.max(0, requestedOffset - session.bufferStartOffset);
+    const rawSource = session.output.slice(startIndex);
+    const rawChars = rawSource.length;
+    const source = outputMode === 'raw' ? rawSource : normalizeTerminalOutput(rawSource);
     const lineLimited = outputMode === 'raw' ? source : tailLines(source, maxLines);
     const output = lineLimited.slice(-maxChars);
     const truncated = output.length < source.length;
-    if (opts.clear) session.output = '';
+    const nextOffset = session.bufferStartOffset + session.output.length;
+    if (opts.clear) {
+        session.output = '';
+        session.bufferStartOffset = nextOffset;
+    }
     return {
         output,
         outputMode,
         rawChars,
         returnedChars: output.length,
         truncated,
+        nextOffset,
+        droppedChars,
+    };
+}
+
+function jobOutput(job: CodexJob, opts: { maxChars?: number; sinceOffset?: number } = {}): SessionOutputView {
+    const maxChars = Math.max(1, opts.maxChars ?? DEFAULT_READ_CHARS);
+    const requestedOffset = opts.sinceOffset ?? job.bufferStartOffset;
+    const droppedChars = Math.max(0, job.bufferStartOffset - requestedOffset);
+    const startIndex = Math.max(0, requestedOffset - job.bufferStartOffset);
+    const source = job.output.slice(startIndex);
+    const output = source.slice(-maxChars);
+    return {
+        output,
+        outputMode: 'raw',
+        rawChars: source.length,
+        returnedChars: output.length,
+        truncated: output.length < source.length,
+        nextOffset: job.bufferStartOffset + job.output.length,
+        droppedChars,
     };
 }
 
@@ -175,13 +250,17 @@ function runProcess(command: string, args: string[], opts: {
             shell: false,
             env: process.env,
             windowsHide: true,
+            detached: !isWindows,
         });
 
         let stdout = '';
         let stderr = '';
+        let timedOut = false;
         const timer = setTimeout(() => {
-            child.kill('SIGTERM');
-            reject(new Error(`Command timed out after ${opts.timeoutMs}ms`));
+            timedOut = true;
+            killChildTree(child, 'SIGTERM');
+            const killTimer = setTimeout(() => killChildTree(child, 'SIGKILL'), 5_000);
+            child.once('close', () => clearTimeout(killTimer));
         }, opts.timeoutMs);
 
         child.stdout?.on('data', chunk => {
@@ -196,7 +275,11 @@ function runProcess(command: string, args: string[], opts: {
         });
         child.on('close', (code, signal) => {
             clearTimeout(timer);
-            resolve({ code, signal, stdout, stderr });
+            if (timedOut) {
+                reject(new Error(`Command timed out after ${opts.timeoutMs}ms (signal ${signal})`));
+            } else {
+                resolve({ code, signal, stdout, stderr });
+            }
         });
 
         if (opts.input !== undefined) {
@@ -209,15 +292,96 @@ function jsonText(value: unknown): string {
     return JSON.stringify(value, null, 2);
 }
 
+function scheduleJobCleanup(job: CodexJob): void {
+    const timer = setTimeout(() => jobs.delete(job.id), FINISHED_RETENTION_MS);
+    timer.unref();
+}
+
+function startExecJob(opts: {
+    prompt: string;
+    cwd: string;
+    command: string;
+    model?: string;
+    profile?: string;
+    sandbox?: SandboxMode;
+    yolo?: boolean;
+    addDirs?: string[];
+    config?: string[];
+    stdin?: string;
+    timeoutMs: number;
+    resumeThreadId?: string;
+}): CodexJob {
+    const args = opts.resumeThreadId ? ['exec', 'resume'] : ['exec'];
+    if (opts.resumeThreadId) {
+        if (opts.model) args.push('--model', opts.model);
+        if (opts.yolo) args.push('--dangerously-bypass-approvals-and-sandbox');
+        for (const cfg of opts.config || []) args.push('--config', cfg);
+        args.push('--json', opts.resumeThreadId, opts.prompt);
+    } else {
+        appendCommonCodexArgs(args, {
+            cwd: opts.cwd,
+            model: opts.model,
+            profile: opts.profile,
+            sandbox: opts.yolo ? undefined : opts.sandbox,
+            yolo: opts.yolo,
+            addDirs: opts.addDirs,
+            config: opts.config,
+        });
+        args.push('--json', opts.prompt);
+    }
+
+    const child = spawnChild(opts.command, args, {
+        cwd: opts.cwd,
+        shell: false,
+        env: process.env,
+        windowsHide: true,
+        detached: !isWindows,
+    });
+    const job: CodexJob = {
+        id: randomUUID(),
+        command: opts.command,
+        args,
+        cwd: opts.cwd,
+        createdAt: new Date().toISOString(),
+        process: child,
+        output: '',
+        bufferStartOffset: 0,
+        timedOut: false,
+    };
+    jobs.set(job.id, job);
+
+    child.stdout?.on('data', chunk => appendJobOutput(job, chunk.toString('utf8')));
+    child.stderr?.on('data', chunk => appendJobOutput(job, `[stderr] ${chunk.toString('utf8')}`));
+    child.on('error', err => appendJobOutput(job, `[process error] ${err.message}\n`));
+    child.on('close', (code, signal) => {
+        job.exitCode = code;
+        job.exitSignal = signal;
+        if (job.timeout) clearTimeout(job.timeout);
+        if (job.killTimeout) clearTimeout(job.killTimeout);
+        appendJobOutput(job, `[codex job exited: code=${code} signal=${signal ?? 'none'}]\n`);
+        scheduleJobCleanup(job);
+    });
+
+    job.timeout = setTimeout(() => {
+        job.timedOut = true;
+        killChildTree(child, 'SIGTERM');
+        job.killTimeout = setTimeout(() => killChildTree(child, 'SIGKILL'), 5_000);
+        job.killTimeout.unref();
+    }, opts.timeoutMs);
+    job.timeout.unref();
+    child.stdin?.end(opts.stdin);
+    return job;
+}
+
 const server = new McpServer({
     name: 'Codex Terminal',
-    version: '1.0.0',
+    version: '1.0.1',
     title: 'Codex Terminal',
     description: 'Start and control OpenAI Codex CLI coding sessions.',
     icons: [{ src: 'https://unpkg.com/@cynosure-mcp/codex-terminal@1.0.1/icon.png', mimeType: 'image/png' }],
 });
 
-const approvalSchema = z.enum(['untrusted', 'on-request', 'never']);
+const approvalSchema = z.enum(['on-request', 'never']);
 const sandboxSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access']);
 const outputModeSchema = z.enum(['clean', 'raw']);
 
@@ -261,9 +425,7 @@ server.registerTool(
             codex_command: z.string().optional().describe('Codex executable path or command name. Defaults to CODEX_CLI_PATH or codex.'),
             model: z.string().optional().describe('Optional model override, passed as --model.'),
             profile: z.string().optional().describe('Optional Codex profile, passed as --profile.'),
-            approval: approvalSchema.optional().describe('Approval mode, passed as --ask-for-approval.'),
             sandbox: sandboxSchema.optional().default('read-only').describe('Sandbox mode. Codex exec defaults read-only; choose workspace-write for edits.'),
-            search: z.boolean().optional().default(false).describe('Enable live web search for this run.'),
             yolo: z.boolean().optional().default(false).describe('Pass --dangerously-bypass-approvals-and-sandbox. Use only in isolated trusted environments.'),
             add_dirs: z.array(z.string()).optional().default([]).describe('Additional directories to grant access with --add-dir.'),
             config: z.array(z.string()).optional().default([]).describe('Raw Codex -c/--config key=value overrides.'),
@@ -273,17 +435,16 @@ server.registerTool(
             timeout_ms: z.number().int().min(1_000).max(3_600_000).optional().default(600_000).describe('Maximum runtime in milliseconds.'),
         },
     },
-    async ({ prompt, cwd, codex_command, model, profile, approval, sandbox, search, yolo, add_dirs, config, json, output_last_message_path, stdin, timeout_ms }) => {
+    async ({ prompt, cwd, codex_command, model, profile, sandbox, yolo, add_dirs, config, json, output_last_message_path, stdin, timeout_ms }) => {
         try {
             const resolvedCwd = resolveCwd(cwd);
             const command = codexCommand(codex_command);
             const args = ['exec'];
             appendCommonCodexArgs(args, {
+                cwd: resolvedCwd,
                 model,
                 profile,
-                approval,
-                sandbox,
-                search,
+                sandbox: yolo ? undefined : sandbox,
                 yolo,
                 addDirs: add_dirs,
                 config,
@@ -318,6 +479,174 @@ server.registerTool(
 );
 
 server.registerTool(
+    'start_codex_job',
+    {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        description: 'Start a long-running codex exec job and return immediately. Poll it with read_codex_job using next_offset.',
+        inputSchema: {
+            prompt: z.string().min(1).describe('Coding task for Codex.'),
+            cwd: z.string().optional().describe('Working directory. Defaults to the MCP process working directory.'),
+            codex_command: z.string().optional().describe('Codex executable path or command name.'),
+            model: z.string().optional(),
+            profile: z.string().optional(),
+            sandbox: sandboxSchema.optional().default('workspace-write'),
+            yolo: z.boolean().optional().default(false),
+            add_dirs: z.array(z.string()).optional().default([]),
+            config: z.array(z.string()).optional().default([]),
+            stdin: z.string().optional().describe('Optional context appended on stdin.'),
+            timeout_ms: z.number().int().min(1_000).max(86_400_000).optional().default(7_200_000).describe('Hard job deadline; defaults to two hours.'),
+            initial_read_ms: z.number().int().min(0).max(10_000).optional().default(250),
+            max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS),
+        },
+    },
+    async ({ prompt, cwd, codex_command, model, profile, sandbox, yolo, add_dirs, config, stdin, timeout_ms, initial_read_ms, max_chars }) => {
+        try {
+            const resolvedCwd = resolveCwd(cwd);
+            const job = startExecJob({
+                prompt,
+                cwd: resolvedCwd,
+                command: codexCommand(codex_command),
+                model,
+                profile,
+                sandbox,
+                yolo,
+                addDirs: add_dirs,
+                config,
+                stdin,
+                timeoutMs: timeout_ms,
+            });
+            if (initial_read_ms) await new Promise(resolve => setTimeout(resolve, initial_read_ms));
+            return {
+                content: [{ type: 'text', text: jsonText({
+                    jobId: job.id,
+                    threadId: job.threadId,
+                    cwd: job.cwd,
+                    running: job.exitCode === undefined,
+                    timedOut: job.timedOut,
+                    ...jobOutput(job, { maxChars: max_chars }),
+                }) }],
+            };
+        } catch (err) {
+            return { content: [{ type: 'text', text: `Failed to start Codex job: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+        }
+    },
+);
+
+server.registerTool(
+    'resume_codex_job',
+    {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        description: 'Resume a persisted Codex thread as a new asynchronous job. This also works after the MCP server restarts.',
+        inputSchema: {
+            thread_id: z.string().min(1).describe('Codex thread ID returned by a previous job.'),
+            prompt: z.string().min(1).describe('Follow-up task for the existing Codex thread.'),
+            cwd: z.string().optional(),
+            codex_command: z.string().optional(),
+            model: z.string().optional(),
+            yolo: z.boolean().optional().default(false),
+            config: z.array(z.string()).optional().default([]),
+            stdin: z.string().optional(),
+            timeout_ms: z.number().int().min(1_000).max(86_400_000).optional().default(7_200_000),
+            initial_read_ms: z.number().int().min(0).max(10_000).optional().default(250),
+            max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS),
+        },
+    },
+    async ({ thread_id, prompt, cwd, codex_command, model, yolo, config, stdin, timeout_ms, initial_read_ms, max_chars }) => {
+        try {
+            const resolvedCwd = resolveCwd(cwd);
+            const job = startExecJob({
+                prompt,
+                cwd: resolvedCwd,
+                command: codexCommand(codex_command),
+                model,
+                yolo,
+                config,
+                stdin,
+                timeoutMs: timeout_ms,
+                resumeThreadId: thread_id,
+            });
+            if (initial_read_ms) await new Promise(resolve => setTimeout(resolve, initial_read_ms));
+            return { content: [{ type: 'text', text: jsonText({
+                jobId: job.id,
+                threadId: thread_id,
+                cwd: job.cwd,
+                running: job.exitCode === undefined,
+                timedOut: job.timedOut,
+                ...jobOutput(job, { maxChars: max_chars }),
+            }) }] };
+        } catch (err) {
+            return { content: [{ type: 'text', text: `Failed to resume Codex job: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+        }
+    },
+);
+
+server.registerTool(
+    'read_codex_job',
+    {
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        description: 'Poll a Codex job. Pass the previous next_offset as since_offset to receive only new output.',
+        inputSchema: {
+            job_id: z.string(),
+            since_offset: z.number().int().min(0).optional(),
+            max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS),
+        },
+    },
+    async ({ job_id, since_offset, max_chars }) => {
+        const job = jobs.get(job_id);
+        if (!job) return { content: [{ type: 'text', text: `Unknown or expired Codex job: ${job_id}` }], isError: true };
+        return { content: [{ type: 'text', text: jsonText({
+            jobId: job.id,
+            threadId: job.threadId,
+            running: job.exitCode === undefined,
+            timedOut: job.timedOut,
+            exitCode: job.exitCode,
+            exitSignal: job.exitSignal,
+            ...jobOutput(job, { maxChars: max_chars, sinceOffset: since_offset }),
+        }) }] };
+    },
+);
+
+server.registerTool(
+    'stop_codex_job',
+    {
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        description: 'Stop a running Codex job. Sends SIGTERM, then SIGKILL after five seconds if needed.',
+        inputSchema: { job_id: z.string() },
+    },
+    async ({ job_id }) => {
+        const job = jobs.get(job_id);
+        if (!job) return { content: [{ type: 'text', text: `Unknown or expired Codex job: ${job_id}` }], isError: true };
+        if (job.exitCode === undefined) {
+            killChildTree(job.process, 'SIGTERM');
+            job.killTimeout = setTimeout(() => killChildTree(job.process, 'SIGKILL'), 5_000);
+            job.killTimeout.unref();
+        }
+        return { content: [{ type: 'text', text: jsonText({ jobId: job.id, stopping: job.exitCode === undefined }) }] };
+    },
+);
+
+server.registerTool(
+    'list_codex_jobs',
+    {
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        description: 'List Codex exec jobs retained by this MCP process.',
+        inputSchema: {},
+    },
+    async () => ({ content: [{ type: 'text', text: jsonText([...jobs.values()].map(job => ({
+        jobId: job.id,
+        threadId: job.threadId,
+        cwd: job.cwd,
+        createdAt: job.createdAt,
+        running: job.exitCode === undefined,
+        timedOut: job.timedOut,
+        exitCode: job.exitCode,
+        exitSignal: job.exitSignal,
+        bufferedChars: job.output.length,
+        nextOffset: job.bufferStartOffset + job.output.length,
+    }))) }] }),
+);
+
+server.registerTool(
     'start_codex_session',
     {
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -349,10 +678,11 @@ server.registerTool(
             const command = codexCommand(codex_command);
             const args: string[] = [];
             appendCommonCodexArgs(args, {
+                cwd: resolvedCwd,
                 model,
                 profile,
-                approval,
-                sandbox,
+                approval: yolo ? undefined : approval,
+                sandbox: yolo ? undefined : sandbox,
                 search,
                 yolo,
                 addDirs: add_dirs,
@@ -380,6 +710,7 @@ server.registerTool(
                 rows,
                 process: term,
                 output: '',
+                bufferStartOffset: 0,
             };
             sessions.set(id, session);
 
@@ -392,6 +723,8 @@ server.registerTool(
                 session.exitSignal = signal;
                 session.output += `\n[Codex session exited: code=${exitCode} signal=${signal}]\n`;
                 trimSessionBuffer(session);
+                const cleanup = setTimeout(() => sessions.delete(id), FINISHED_RETENTION_MS);
+                cleanup.unref();
             });
 
             if (initial_read_ms) {
@@ -404,7 +737,6 @@ server.registerTool(
                     text: jsonText({
                         sessionId: id,
                         command,
-                        args,
                         cwd: resolvedCwd,
                         running: session.exitCode === undefined,
                         ...lastOutput(session, { maxChars: max_chars, outputMode: output_mode, maxLines: max_lines }),
@@ -423,7 +755,7 @@ server.registerTool(
 server.registerTool(
     'read_codex_session',
     {
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
         description: 'Read buffered terminal output from a running or recently exited interactive Codex session.',
         inputSchema: {
             session_id: z.string().describe('Session ID returned by start_codex_session.'),
@@ -431,9 +763,10 @@ server.registerTool(
             max_lines: z.number().int().min(1).max(2_000).optional().default(DEFAULT_READ_LINES).describe('Maximum cleaned terminal lines to return before applying max_chars. Ignored for raw output.'),
             output_mode: outputModeSchema.optional().default('clean').describe('Return clean readable terminal text by default, or raw PTY bytes for debugging.'),
             clear: z.boolean().optional().default(false).describe('Clear the session buffer after reading.'),
+            since_offset: z.number().int().min(0).optional().describe('Previous nextOffset; returns only output received after it.'),
         },
     },
-    async ({ session_id, max_chars, max_lines, output_mode, clear }) => {
+    async ({ session_id, max_chars, max_lines, output_mode, clear, since_offset }) => {
         const session = sessions.get(session_id);
         if (!session) {
             return { content: [{ type: 'text', text: `Unknown Codex session: ${session_id}` }], isError: true };
@@ -446,7 +779,7 @@ server.registerTool(
                     running: session.exitCode === undefined,
                     exitCode: session.exitCode,
                     exitSignal: session.exitSignal,
-                    ...lastOutput(session, { maxChars: max_chars, maxLines: max_lines, outputMode: output_mode, clear }),
+                    ...lastOutput(session, { maxChars: max_chars, maxLines: max_lines, outputMode: output_mode, clear, sinceOffset: since_offset }),
                 }),
             }],
         };
@@ -467,9 +800,11 @@ server.registerTool(
             max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS).describe('Maximum characters of output to return.'),
             max_lines: z.number().int().min(1).max(2_000).optional().default(DEFAULT_READ_LINES).describe('Maximum cleaned terminal lines to return before applying max_chars. Ignored for raw output.'),
             output_mode: outputModeSchema.optional().default('clean').describe('Return clean readable terminal text by default, or raw PTY bytes for debugging.'),
+            submit_delay_ms: z.number().int().min(0).max(1_000).optional().default(50).describe('Delay between writing text and Enter; avoids Codex TUI paste/submit races.'),
+            since_offset: z.number().int().min(0).optional().describe('Previous nextOffset; returns only newer output.'),
         },
     },
-    async ({ session_id, text, submit, control, read_after_ms, max_chars, max_lines, output_mode }) => {
+    async ({ session_id, text, submit, control, read_after_ms, max_chars, max_lines, output_mode, submit_delay_ms, since_offset }) => {
         const session = sessions.get(session_id);
         if (!session) {
             return { content: [{ type: 'text', text: `Unknown Codex session: ${session_id}` }], isError: true };
@@ -480,6 +815,7 @@ server.registerTool(
 
         try {
             if (text) session.process.write(text);
+            if (text && submit && submit_delay_ms) await new Promise(resolve => setTimeout(resolve, submit_delay_ms));
             if (submit) session.process.write('\r');
             if (control) session.process.write(controlSequence(control));
             if (read_after_ms) {
@@ -491,7 +827,7 @@ server.registerTool(
                     text: jsonText({
                         sessionId: session.id,
                         running: session.exitCode === undefined,
-                        ...lastOutput(session, { maxChars: max_chars, maxLines: max_lines, outputMode: output_mode }),
+                        ...lastOutput(session, { maxChars: max_chars, maxLines: max_lines, outputMode: output_mode, sinceOffset: since_offset }),
                     }),
                 }],
             };
@@ -521,8 +857,11 @@ server.registerTool(
         }
         try {
             if (session.exitCode === undefined) {
-                if (!force) session.process.write('\x03');
-                session.process.kill();
+                if (!force) {
+                    session.process.write('\x03');
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                }
+                if (session.exitCode === undefined) session.process.kill();
             }
             sessions.delete(session_id);
             return { content: [{ type: 'text', text: `Stopped Codex session ${session_id}.` }] };
@@ -548,7 +887,6 @@ server.registerTool(
             text: jsonText([...sessions.values()].map(session => ({
                 sessionId: session.id,
                 command: session.command,
-                args: session.args,
                 cwd: session.cwd,
                 createdAt: session.createdAt,
                 running: session.exitCode === undefined,
@@ -569,6 +907,9 @@ async function main(): Promise<void> {
 process.on('exit', () => {
     for (const session of sessions.values()) {
         try { session.process.kill(); } catch { /* best effort */ }
+    }
+    for (const job of jobs.values()) {
+        try { if (job.exitCode === undefined) killChildTree(job.process, 'SIGKILL'); } catch { /* best effort */ }
     }
 });
 
