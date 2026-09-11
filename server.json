@@ -2,10 +2,10 @@
     "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
     "name": "io.github.andreasjhagen/codex-terminal",
     "description": "MCP server for starting and controlling Codex CLI coding sessions",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "icons": [
         {
-            "src": "https://unpkg.com/@cynosure-mcp/codex-terminal@1.0.1/icon.png",
+            "src": "https://unpkg.com/@cynosure-mcp/codex-terminal@1.1.0/icon.png",
             "mimeType": "image/png"
         }
     ],
@@ -13,7 +13,7 @@
         {
             "registryType": "npm",
             "identifier": "@cynosure-mcp/codex-terminal",
-            "version": "1.0.1",
+            "version": "1.1.0",
             "transport": {
                 "type": "stdio"
             },
