@@ -29,6 +29,9 @@ jobs:
       - name: Verify release metadata
         run: npm run release:check
 
+      - name: Prepare native terminal dependency
+        run: npm rebuild node-pty
+
       - name: Build
         run: npm run build
 
