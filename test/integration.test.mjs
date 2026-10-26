@@ -92,6 +92,21 @@ test('submits interactive input and supports incremental reads', async t => {
   await client.callTool({ name: 'stop_codex_session', arguments: { session_id: started.sessionId, force: true } });
 });
 
+test('sends a control key alone without pressing Enter first', async t => {
+  const { client } = await connect();
+  t.after(() => client.close());
+  const started = parsed(await client.callTool({
+    name: 'start_codex_session',
+    arguments: { codex_command: fakeCodex, initial_read_ms: 100 },
+  }));
+  const sent = parsed(await client.callTool({
+    name: 'send_codex_input',
+    arguments: { session_id: started.sessionId, control: 'tab', read_after_ms: 150, since_offset: started.nextOffset },
+  }));
+  assert.doesNotMatch(sent.output, /received:/);
+  await client.callTool({ name: 'stop_codex_session', arguments: { session_id: started.sessionId, force: true } });
+});
+
 test('times out a background job and reports that state', async t => {
   const { client } = await connect();
   t.after(() => client.close());

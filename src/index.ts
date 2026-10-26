@@ -379,6 +379,13 @@ const server = new McpServer({
     title: 'Codex Terminal',
     description: 'Start and control OpenAI Codex CLI coding sessions.',
     icons: [{ src: 'https://unpkg.com/@cynosure-mcp/codex-terminal@1.0.1/icon.png', mimeType: 'image/png' }],
+}, {
+    instructions: `Three ways to run Codex:
+- codex_exec runs one short task and blocks until it finishes (default timeout 10 minutes). Its sandbox defaults to read-only, so pass sandbox "workspace-write" when the task should edit files.
+- start_codex_job is the default for real coding tasks. It returns at once with a jobId (sandbox defaults to workspace-write). Poll with read_codex_job, passing the previous nextOffset as since_offset to get only new JSONL output, until running is false. The job output reports a threadId; keep it. resume_codex_job sends a follow-up to that thread as a new job, and works even after this server restarts. Finished jobs are kept for 24 hours.
+- start_codex_session opens the interactive TUI for steering or approvals. Use send_codex_input and read_codex_session with since_offset; read_after_ms is a fixed wait (max 10 s), so poll again for long turns. Approval prompts are answered with control keys or text.
+
+Jobs and sessions live in this MCP process; stop ones you no longer need with stop_codex_job or stop_codex_session. Check check_codex_cli first if the CLI may be missing. yolo bypasses all approvals and sandboxing; use it only when the user asked for that in an isolated environment.`,
 });
 
 const approvalSchema = z.enum(['on-request', 'never']);
@@ -794,7 +801,7 @@ server.registerTool(
         inputSchema: {
             session_id: z.string().describe('Session ID returned by start_codex_session.'),
             text: z.string().optional().default('').describe('Text to send to the Codex terminal.'),
-            submit: z.boolean().optional().default(true).describe('Append Enter after text, useful for sending a prompt from the composer.'),
+            submit: z.boolean().optional().default(true).describe('Append Enter after text, useful for sending a prompt from the composer. Has no effect when text is empty.'),
             control: z.enum(['enter', 'escape', 'tab', 'ctrl-c', 'ctrl-d', 'ctrl-l', 'ctrl-o', 'up', 'down', 'left', 'right']).optional().describe('Optional control key to send after text.'),
             read_after_ms: z.number().int().min(0).max(10_000).optional().default(1000).describe('Milliseconds to wait before returning new output.'),
             max_chars: z.number().int().min(1).max(MAX_BUFFER_CHARS).optional().default(DEFAULT_READ_CHARS).describe('Maximum characters of output to return.'),
@@ -815,8 +822,10 @@ server.registerTool(
 
         try {
             if (text) session.process.write(text);
-            if (text && submit && submit_delay_ms) await new Promise(resolve => setTimeout(resolve, submit_delay_ms));
-            if (submit) session.process.write('\r');
+            if (text && submit) {
+                if (submit_delay_ms) await new Promise(resolve => setTimeout(resolve, submit_delay_ms));
+                session.process.write('\r');
+            }
             if (control) session.process.write(controlSequence(control));
             if (read_after_ms) {
                 await new Promise(resolve => setTimeout(resolve, read_after_ms));
